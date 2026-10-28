@@ -27,6 +27,11 @@ module DiscourseActivityPub
     end
 
     def get_json_ld
+      # Share one foreground network budget across JSON-LD redirects.
+      appinn_previous_deadline = @appinn_read_deadline
+      if Thread.current["discourse.processing_request"]
+        @appinn_read_deadline ||= Process.clock_gettime(Process::CLOCK_MONOTONIC) + 5.0
+      end
       @headers.merge!({ "Accept" => content_type_header })
       @expects = SUCCESS_CODES + REDIRECT_CODES + allowed_errors
 
@@ -39,6 +44,8 @@ module DiscourseActivityPub
       end
 
       response ? validate_json_ld(response.body) : nil
+    ensure
+      @appinn_read_deadline = appinn_previous_deadline
     end
 
     def post_json_ld
@@ -56,7 +63,23 @@ module DiscourseActivityPub
     end
 
     def perform(verb)
-      request_uri = safe_request_uri
+      # Only foreground GETs are shortened. Preserve background delivery.
+      appinn_deadline = nil
+      if verb == :get && Thread.current["discourse.processing_request"]
+        appinn_deadline =
+          @appinn_read_deadline || (Process.clock_gettime(Process::CLOCK_MONOTONIC) + 5.0)
+        appinn_remaining = appinn_deadline - Process.clock_gettime(Process::CLOCK_MONOTONIC)
+        return nil if appinn_remaining <= 0
+        # Bound DNS/SSRF resolution without bypassing the original checks.
+        request_uri =
+          begin
+            Timeout.timeout([2.0, appinn_remaining].min) { safe_request_uri }
+          rescue Timeout::Error
+            nil
+          end
+      else
+        request_uri = safe_request_uri
+      end
       return unless request_uri
 
       options = { headers: final_headers(verb) }
@@ -65,6 +88,14 @@ module DiscourseActivityPub
       options[:body] = body if body.present?
       options[:read_timeout] = TIMEOUT
       options[:write_timeout] = TIMEOUT
+      if appinn_deadline
+        appinn_remaining = appinn_deadline - Process.clock_gettime(Process::CLOCK_MONOTONIC)
+        return nil if appinn_remaining <= 0
+        options[:connect_timeout] = [2.0, appinn_remaining].min
+        options[:read_timeout] = appinn_remaining
+        options[:write_timeout] = appinn_remaining
+        options[:timeout] = appinn_remaining
+      end
       options[:ssl_verify_peer_host] = uri.host
 
       response = Excon.send(verb, request_uri.to_s, options)
