@@ -10,6 +10,8 @@ discourse_activity_pub:
     default: 0
   activity_pub_note_link_to_forum:
     default: true
+  activity_pub_async_inbox_verification:
+    default: true
   activity_pub_require_signed_requests:
     default: true
   activity_pub_allowed_request_origins:

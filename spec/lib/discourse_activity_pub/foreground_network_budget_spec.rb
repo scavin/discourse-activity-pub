@@ -5,6 +5,11 @@ require "socket"
 RSpec.describe DiscourseActivityPub::Request do
   describe "#perform" do
     it "releases a foreground reader while a real HTTP peer is still stalled" do
+      webmock_config = WebMock::Config.instance
+      previous_webmock_config =
+        %i[allow_net_connect allow_localhost allow].to_h do |option|
+          [option, webmock_config.public_send(option)]
+        end
       server = TCPServer.new("127.0.0.1", 0)
       socket = nil
       peer =
@@ -41,7 +46,9 @@ RSpec.describe DiscourseActivityPub::Request do
       expect(elapsed).to be_between(4.0, 5.8)
     ensure
       Thread.current["discourse.processing_request"] = nil
-      WebMock.disable_net_connect!
+      previous_webmock_config&.each do |option, value|
+        webmock_config.public_send("#{option}=", value)
+      end
       peer&.kill
       peer&.join
       socket&.close

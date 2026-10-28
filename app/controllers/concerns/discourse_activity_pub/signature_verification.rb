@@ -48,6 +48,12 @@ module DiscourseActivityPub
     def signed_request_actor
       return @signed_request_actor if defined?(@signed_request_actor)
 
+      context = signature_verification_context
+      signed_actor_from_context(context) if context
+    end
+
+    # Check request-only properties at receipt, before a queued job can be delayed.
+    def signature_verification_context
       raise Error, "not_signed" unless signed_request?
       raise Error, "missing_signature_params" if missing_required_signature_parameters?
       if SUPPORTED_ALOGRITHMS.exclude?(signature_algorithm)
@@ -58,23 +64,44 @@ module DiscourseActivityPub
       verify_signature_strength!
       verify_body_digest!
 
-      actor = actor_from_key_id(signature_params["keyId"])
-      raise Error.new(key_id: signature_params["keyId"]), "actor_not_found_for_key" if !actor
+      context = {
+        "key_id" => signature_params["keyId"],
+        "signature" => signature_params["signature"],
+        "signed_string" => signed_string,
+      }
+      raise Error, "bad_request" if context.values.any? { |value| value.bytesize > 16_384 }
+      context
+    rescue Error => error
+      record_signature_failure(error)
+    end
 
-      signature = Base64.decode64(signature_params["signature"])
-      return actor if verify_signature(actor, signature)
+    def signed_actor_from_context(context)
+      actor = actor_from_key_id(context.fetch("key_id"))
+      raise Error.new(key_id: context["key_id"]), "actor_not_found_for_key" unless actor
 
-      actor.refresh_remote!
-      return actor if verify_signature(actor.reload, signature)
+      signature = Base64.decode64(context.fetch("signature"))
+      signing_string = context.fetch("signed_string")
+      return actor if verify_signature(actor, signature, signing_string)
+
+      unless actor.local?
+        refreshed_actor = actor_from_key_id(context.fetch("key_id"), force_refresh: true)
+        if refreshed_actor && verify_signature(refreshed_actor, signature, signing_string)
+          return refreshed_actor
+        end
+      end
 
       raise Error.new(id: actor.ap_id), "signature_verification_failed"
-    rescue Error => e
-      @signature_verification_failure_reason = e.message
-      @signature_verification_failure_opts = e.opts
-      @signed_request_actor = nil
+    rescue Error => error
+      record_signature_failure(error)
     end
 
     private
+
+    def record_signature_failure(error)
+      @signature_verification_failure_reason = error.message
+      @signature_verification_failure_opts = error.opts
+      @signed_request_actor = nil
+    end
 
     def signature_params
       @signature_params ||= SignatureParser.new(request.headers["Signature"]).parse
@@ -135,11 +162,11 @@ module DiscourseActivityPub
       raise Error.new(computed: body_digest, digest: sha256[1]), "invalid_digest"
     end
 
-    def verify_signature(actor, signature)
+    def verify_signature(actor, signature, signing_string)
       unless actor.keypair.public_key.verify(
                OpenSSL::Digest.new("SHA256"),
                signature,
-               signed_string,
+               signing_string,
              )
         return false
       end
@@ -220,7 +247,7 @@ module DiscourseActivityPub
       signature_params["keyId"].blank? || signature_params["signature"].blank?
     end
 
-    def actor_from_key_id(key_id)
+    def actor_from_key_id(key_id, force_refresh: false)
       ap_id = key_id.split("#").first
       acct_key_id = ap_id.start_with?("acct:")
       domain =
@@ -249,7 +276,7 @@ module DiscourseActivityPub
 
       actor = DiscourseActivityPubActor.find_by(ap_id: ap_id)
 
-      if acct_key_id || !actor
+      if acct_key_id || !actor || force_refresh
         actor = nil
         ap_actor = AP::Actor.resolve(ap_id)
         if resolved_actor_matches_key_id_actor?(ap_actor, ap_id)

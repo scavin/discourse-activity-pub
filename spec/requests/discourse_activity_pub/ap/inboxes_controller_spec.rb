@@ -1,6 +1,8 @@
 # frozen_string_literal: true
 
 RSpec.describe DiscourseActivityPub::AP::InboxesController do
+  before { SiteSetting.activity_pub_async_inbox_verification = false }
+
   let!(:keypair) { OpenSSL::PKey::RSA.new(2048) }
   let!(:person) do
     Fabricate(:discourse_activity_pub_actor_person, public_key: keypair.public_key.to_pem)
@@ -195,9 +197,10 @@ RSpec.describe DiscourseActivityPub::AP::InboxesController do
           after { teardown_logging }
 
           it "attempts to refresh actor and returns the right error" do
-            DiscourseActivityPubActor.any_instance.expects(:refresh_remote!).once.returns(nil)
+            remote = stub_request(:get, person.ap_id).to_return(status: 404)
             post_to_inbox(group, body: post_body, headers: headers)
             expect_request_error(response, "signature_verification_failed", 401, id: person.ap_id)
+            expect(remote).to have_been_requested.once
           end
 
           it "succeeds if actor is refreshed with a valid public key" do
@@ -231,7 +234,7 @@ RSpec.describe DiscourseActivityPub::AP::InboxesController do
         context "with a valid public key" do
           let(:headers) { build_post_headers }
 
-          it "succeeds" do
+          it "accepts a signature matching the cached public key" do
             post_to_inbox(group, body: post_body, headers: headers)
             expect(response.status).to eq(202)
           end
@@ -313,6 +316,7 @@ RSpec.describe DiscourseActivityPub::AP::InboxesController do
               expect(remote_post.reload.raw).to eq("Original remote post")
             end
           end
+
           context "with an actor from an allowed domain" do
             before { SiteSetting.activity_pub_allowed_request_origins = "remote.com" }
 

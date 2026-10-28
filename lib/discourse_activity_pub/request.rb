@@ -62,50 +62,87 @@ module DiscourseActivityPub
       response ? true : false
     end
 
+    def self.with_network_budget(seconds:)
+      previous = Thread.current[:activity_pub_network_budget]
+      deadline = Process.clock_gettime(Process::CLOCK_MONOTONIC) + seconds
+      deadline = [deadline, previous[:deadline]].min if previous
+      budget = { deadline: deadline, failed: false }
+      Thread.current[:activity_pub_network_budget] = budget
+      yield budget
+    ensure
+      previous[:failed] ||= budget[:failed] if previous && budget
+      Thread.current[:activity_pub_network_budget] = previous
+    end
+
     def perform(verb)
-      # Only foreground GETs are shortened. Preserve background delivery.
-      appinn_deadline = nil
+      budget = Thread.current[:activity_pub_network_budget] if verb == :get
+      deadline = budget && budget[:deadline]
       if verb == :get && Thread.current["discourse.processing_request"]
-        appinn_deadline =
+        foreground_deadline =
           @appinn_read_deadline || (Process.clock_gettime(Process::CLOCK_MONOTONIC) + 5.0)
-        appinn_remaining = appinn_deadline - Process.clock_gettime(Process::CLOCK_MONOTONIC)
-        return nil if appinn_remaining <= 0
-        # Bound DNS/SSRF resolution without bypassing the original checks.
-        request_uri =
-          begin
-            Timeout.timeout([2.0, appinn_remaining].min) { safe_request_uri }
-          rescue Timeout::Error
-            nil
-          end
+        deadline = [deadline, foreground_deadline].compact.min
+      end
+
+      cache_key = "activity_pub:gone:#{Digest::SHA256.hexdigest(uri.to_s)}" if verb == :get
+      cached = Discourse.redis.get(cache_key) if cache_key
+      if cached
+        response = Excon::Response.new(JSON.parse(cached).symbolize_keys)
       else
-        request_uri = safe_request_uri
+        if deadline
+          remaining = deadline - Process.clock_gettime(Process::CLOCK_MONOTONIC)
+          if remaining <= 0
+            budget[:failed] = true if budget
+            return
+          end
+          request_uri = Timeout.timeout([2.0, remaining].min) { safe_request_uri }
+        else
+          request_uri = safe_request_uri
+        end
+        return unless request_uri
+
+        options = { headers: final_headers(verb), read_timeout: TIMEOUT, write_timeout: TIMEOUT }
+        options[:middlewares] = middlewares if middlewares.present?
+        options[:body] = body if body.present?
+        if deadline
+          remaining = deadline - Process.clock_gettime(Process::CLOCK_MONOTONIC)
+          if remaining <= 0
+            budget[:failed] = true if budget
+            return
+          end
+          options.merge!(
+            connect_timeout: [2.0, remaining].min,
+            read_timeout: remaining,
+            write_timeout: remaining,
+            timeout: remaining,
+          )
+        end
+        options[:ssl_verify_peer_host] = uri.host
+        response = Excon.send(verb, request_uri.to_s, options)
+        unless response
+          budget[:failed] = true if budget
+          return
+        end
+
+        # Cache only a confirmed Gone response; never mark stored actors as deleted.
+        if cache_key && response.status == 410 && response.body.to_s.bytesize <= 16_384
+          Discourse.redis.setex(
+            cache_key,
+            10.minutes.to_i,
+            { status: 410, headers: {}, body: response.body }.to_json,
+          )
+        end
       end
-      return unless request_uri
-
-      options = { headers: final_headers(verb) }
-
-      options[:middlewares] = middlewares if middlewares.present?
-      options[:body] = body if body.present?
-      options[:read_timeout] = TIMEOUT
-      options[:write_timeout] = TIMEOUT
-      if appinn_deadline
-        appinn_remaining = appinn_deadline - Process.clock_gettime(Process::CLOCK_MONOTONIC)
-        return nil if appinn_remaining <= 0
-        options[:connect_timeout] = [2.0, appinn_remaining].min
-        options[:read_timeout] = appinn_remaining
-        options[:write_timeout] = appinn_remaining
-        options[:timeout] = appinn_remaining
+      if budget && ([408, 429].include?(response.status) || response.status.between?(500, 599))
+        budget[:failed] = true
       end
-      options[:ssl_verify_peer_host] = uri.host
-
-      response = Excon.send(verb, request_uri.to_s, options)
 
       if expects.present? && expects.exclude?(response.status)
         raise Excon::Error.new(response.body.to_s[0..200])
       end
 
       response
-    rescue Excon::Error => e
+    rescue Excon::Error, Timeout::Error => e
+      budget[:failed] = true if budget && !response
       DiscourseActivityPub::Logger.warn(
         I18n.t(
           "discourse_activity_pub.request.error.request_to_failed",
@@ -229,11 +266,11 @@ module DiscourseActivityPub
       safe_uri.host = resolved_ip unless Rails.env.test?
 
       safe_uri
-    rescue FinalDestination::SSRFDetector::DisallowedIpError,
-           FinalDestination::SSRFDetector::LookupFailedError,
-           IPAddr::InvalidAddressError,
-           SocketError,
-           Timeout::Error
+    rescue FinalDestination::SSRFDetector::LookupFailedError, SocketError, Timeout::Error
+      budget = Thread.current[:activity_pub_network_budget]
+      budget[:failed] = true if budget
+      nil
+    rescue FinalDestination::SSRFDetector::DisallowedIpError, IPAddr::InvalidAddressError
       nil
     end
 

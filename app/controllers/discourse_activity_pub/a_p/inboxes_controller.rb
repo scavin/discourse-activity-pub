@@ -3,12 +3,14 @@
 class DiscourseActivityPub::AP::InboxesController < DiscourseActivityPub::AP::ActorsController
   requires_plugin DiscourseActivityPub::PLUGIN_NAME
 
+  include DiscourseActivityPub::InboxVerification
+
   before_action :validate_json
-  before_action :ensure_verified_signature, if: :require_signed_requests?
+  before_action :ensure_inbox_signature
 
   def create
     process_json
-    head :accepted
+    head :accepted unless performed?
   end
 
   protected
@@ -24,12 +26,7 @@ class DiscourseActivityPub::AP::InboxesController < DiscourseActivityPub::AP::Ac
   end
 
   def process_json
-    Jobs.enqueue(
-      Jobs::DiscourseActivityPub::Process,
-      json: @json,
-      delivered_to: @actor.ap_id,
-      signed_actor_ap_id: signed_request_actor&.ap_id,
-    )
+    enqueue_inbox_json(delivered_to: @actor.ap_id)
   end
 
   def validate_json

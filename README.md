@@ -1,6 +1,6 @@
 # Discourse ActivityPub Plugin
 
-This fork carries two targeted server-side fixes. See [Appinn maintenance notes](APPINN.md) for scope, validation, installation, and upstream synchronization.
+This fork carries targeted server-side fixes. See [Appinn maintenance notes](APPINN.md) for scope, validation, installation, and upstream synchronization.
 
 Allows you to publish Discourse posts via ActivityPub so they can be read on services that support ActivityPub such as Mastodon. For more information, please see https://meta.discourse.org/t/activitypub-plugin/266794
 
